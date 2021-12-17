@@ -13,6 +13,7 @@ pipeline{
         stage('Maven Build') {
             steps {
                 sh "mvn clean install package"
+                # sh "mv target/*.war target/myapp.war"
             }
         }
         stage('Publish Artifact to S3') {
