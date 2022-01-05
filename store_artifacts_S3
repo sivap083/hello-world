@@ -1,0 +1,31 @@
+pipeline{
+    agent any
+    tools {
+     jdk 'JAVA'
+     maven 'MAVEN-3.8.3'
+    }
+    
+    environment {
+    //Use Pipeline Utility Steps plugin to read information from pom.xml into env variables
+    VERSION = readMavenPom().getVersion()
+    }
+
+    stages{
+        stage('Git checkout') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: '**/tags/v3*']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/sivap083/hello-world.git']]])
+            }
+        }
+        stage('Maven Build') {
+            steps {
+                sh '''mvn clean install package
+                mv webapp/target/*.war webapp/target/artifact-v${VERSION}.war'''
+            }
+        }
+        stage('Publish Artifact to S3') {
+            steps {
+                s3Upload(bucket:"myrepoartifact", includePathPattern:'**/artifact*.war', workingDir:'webapp/target/', metadatas:['Key:SomeValue','Another:Value'])
+            }
+        }
+    }
+}
