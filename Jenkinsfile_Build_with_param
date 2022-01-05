@@ -56,3 +56,13 @@ pipeline{
         }
     }
 }
+===============================================================================================================
+
+properties([parameters([gitParameter(branch: '', branchFilter: '.*', defaultValue: 'master', description: 'build with branch', name: 'branch', quickFilterEnabled: false, selectedValue: 'NONE', sortMode: 'NONE', tagFilter: '*', type: 'PT_BRANCH'), gitParameter(branch: '', branchFilter: '.*', defaultValue: '1.0', description: 'Build with tags', name: 'tags', quickFilterEnabled: false, selectedValue: 'NONE', sortMode: 'NONE', tagFilter: '*', type: 'PT_TAG')])])
+
+node{
+    stage('Git Checkout'){
+        echo "Pulling changes from the branch ${params.branch}"
+        git url: 'https://github.com/sivap083/hello-world.git', branch: "${params.branch}"
+    }
+}
