@@ -32,3 +32,27 @@ pipeline{
         }
     }
 }
+================================================================================================================================
+
+pipeline{
+    agent any
+    tools {
+     jdk 'JAVA'
+     maven 'MAVEN-3.8.3'
+    }
+    parameters {
+    gitParameter branchFilter: 'origin/(.*)', defaultValue: 'master', name: 'BRANCH', type: 'PT_BRANCH'
+    }
+    stages{
+        stage('SCM Checkout') {
+            steps{
+                git branch: "${params.BRANCH}", url: 'https://github.com/sivap083/hello-world.git'
+            }
+        }
+        stage('Maven Build'){
+            steps{
+                sh 'mvn clean package'
+            }
+        }
+    }
+}
