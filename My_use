@@ -86,3 +86,61 @@ pipeline {
         }
     }
 }
+=====================================================================================================================================================================
+pipeline {
+    agent any
+    parameters {
+            gitParameter name: 'BRANCH_TAG',
+                         type: 'PT_BRANCH_TAG',
+                        defaultValue: 'origin/master'
+    }
+    environment {
+    //Use Pipeline Utility Steps plugin to read information from pom.xml into env variables
+        IMAGE = readMavenPom().getArtifactId()
+        VERSION = readMavenPom().getVersion()
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    def gitParams = checkout([$class: 'GitSCM', extensions: [[$class: 'CleanCheckout']],userRemoteConfigs: [[credentialsId: <Credential Id>, url: <GIT URL>]]])
+                    env.branch_name = gitParams['GIT_BRANCH']
+                    echo "${branch_name}"
+                }
+            }
+        }
+        stage('Select Branch') {
+            steps {
+               
+                script {
+                    if (env.branch_name != 'master') {
+
+                        echo "${params.BRANCH_TAG}"
+                        checkout([$class: 'GitSCM',
+                                branches: [[name: "${params.BRANCH_TAG}"]],
+                                doGenerateSubmoduleConfigurations: false,
+                                extensions: [],
+                                gitTool: 'Default',
+                                submoduleCfg: [],
+                                userRemoteConfigs: [[url: <GIT URL>, credentialsId: <Credentials ID>]]
+                        ])
+                    }
+                }
+            }
+        }
+       
+        stage ('Unit Tests') {
+           
+        }
+        stage('Maven Build') {
+            steps {
+                script {
+                    NOW = new Date()
+                    TODAY_DATE = NOW.format("YYYYMMDD")
+                }
+                sh 'mvn clean install package'
+                sh 'mv webapp/target/*.war webapp/target/${IMAGE}_${VERSION}_${TODAY_DATE}'
+            }
+        }
+    }
+}
