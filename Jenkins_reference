@@ -1,0 +1,352 @@
+import com.bcbsm.devops.ie.githubUtils
+
+def call(Map pipelineParams) {
+  //Pipeline block starts here.
+  pipeline {
+  //The 'agent' specifies where the entire Pipeline will execute in the Jenkins environment based on label provided.   
+  //The pipeline will execute on Jenkins build agents having label 'maven'  
+    agent {
+      label 'maven'
+    }
+    
+    environment {
+      SSH_CREDENTIALS         = 'jenkins-devops-integ-sshkeys'
+      jdk                     = tool name: 'JAVA1.8u211'
+      CA_CRED                 = credentials('cacerts')
+      MAVEN_HOME              = tool name: 'maven-global-3.6.1'
+      JAVA_HOME               = "${jdk}"
+      PATH                    = "${jdk}/bin:$PATH:${MAVEN_HOME}/bin:$PATH"
+
+      POM_ARTIFACT_ID         = readMavenPom().getArtifactId()
+      POM_VERSION             = readMavenPom().getVersion()
+      def RELEASE_FOLDER      = "${POM_ARTIFACT_ID}_${POM_VERSION}"
+      // requires timestamp plugin
+      NEXUS_IM_ORG	    = "3744e6221fa8435583d6dac4d211d3ce"
+      NEXUS_URL		    = "https://nexus-iq-server.bcbsm.com/api/v2/applications"
+      NEXUS_BASE_URL  = "http://prxiv0657.bcbsm.com:8070"
+      GITHUB_API_URL = "https://githubprod.bcbsm.com/api/v3/repos/BCBSM"
+      SONATYPE_STAGE = "build"
+      //GIT_REPO_NAME was needed because the app name etl_wcmdr_devops's repo name was etl_wcmdr
+      //causing issues with the github post
+      def GIT_REPO_NAME = env.GIT_URL.replaceFirst(/^.*\/([^\/]+?).git$/, '$1')
+      def commitId            = "${env.GIT_COMMIT}"
+      def DEPLOY_HDFS_FOLDERS = fileExists "./hdfs_folders.txt"
+      def SFTP_FOLDER_CREATION = fileExists "./sftp_folders.txt"
+
+      def S3_CREATE_FOLDERS = fileExists "./s3_create_folders_${ENV}.txt"
+      def EDGE_NODE_IP = "${pipelineParams.edgeNodeIp}"
+      def SERVICE_ACCOUNT_NAME = "${pipelineParams.serviceAccountName}"
+      def ENV = "${pipelineParams.IE_ENV}"
+      def SSH_USER_HOST = "${EDGE_SERVICE_ACCOUNT}@${pipelineParams.edgeNodeIp}"
+      def SSH_TQ = "ssh -o StrictHostKeyChecking=no -T -q ${SSH_USER_HOST}"
+      def SFTP_SERVER_IP = "${pipelineParams.sftpServerIp}"
+      def SFTP_USER_HOST = "${EDGE_SERVICE_ACCOUNT}@${SFTP_SERVER_IP}"
+      def HDFS_SERVICE_ACCOUNT = "${pipelineParams.hdfsServiceAccountName}"
+      def EDGE_SERVICE_ACCOUNT = "${pipelineParams.edgeNodeServiceAccountName}"
+  
+      
+    }
+    //buildDiscarder persist artifacts and console output for the specific number of recent Pipeline runs.
+    //Currently it is set to 15.
+    options {
+      disableConcurrentBuilds()
+      buildDiscarder(logRotator(numToKeepStr: '15'))   
+    }
+    //The following parameters types could be passed at build time.
+    //If no parameters are provided the build stage takes the following defaults.
+    parameters {
+      gitParameter(
+        name: 'TAG',
+        defaultValue: 'origin/master',
+        branchFilter: 'origin/master', 
+        quickFilterEnabled: true, 
+        selectedValue: 'TOP', 
+        sortMode: 'DESCENDING_SMART',  
+        type: 'PT_TAG'
+      )
+    }
+    //All the jenkins pipeline stages go within the stages block
+    stages {
+
+      //Stage to checkout the code from the SCM
+      stage('Checkout code by Tag') {
+        when {
+          expression {GIT_BRANCH.contains("master")}
+        }
+        steps {
+          echo "Checking out ${TAG}"
+          sh "git checkout $TAG"
+        }
+      }
+      //Build Stage.  
+      stage('Build') {
+        environment {
+          JAVA_HOME="${jdk}"
+          PATH="${jdk}/bin:$PATH"
+        }
+        steps {
+          setSshKeyValue()
+          configFileProvider( [configFile(fileId: 'maven-settings-informatics-environment', variable: 'MAVEN_SETTINGS')] ) {
+
+            sh "mvn -U -T 1C -s ${MAVEN_SETTINGS} -Dorg.slf4j.simpleLogger.defaultLogLevel=INFO -Djavax.net.ssl.trustStore=/var/certs/cacerts -DskipTests=false -e ${pipelineParams.mvnBuildCommand}"
+
+            sh """
+              find . -name "*.jar"
+            """
+
+          }
+        }
+      }
+      //Nexus IQ Scan stage. 
+      stage('Sonatype IQ Scan') {
+        steps {
+          setSonatypeStage()
+          echo "_______________________________"
+          echo " Sonatype IQ Scan"
+          echo "_______________________________"
+          configFileProvider( [configFile(fileId: 'maven-settings-informatics-environment', variable: 'MAVEN_SETTINGS')] ) {
+            withCredentials(bindings: [usernamePassword(credentialsId:'nexusadmin', passwordVariable: 'Password', usernameVariable: 'Username')]) {
+              sh """
+                curl --cacert /var/certs/Sonatype.pem -u '${Username}':'${Password}' -X POST -H "Content-Type: application/json" -d '{"publicId": "'"$POM_ARTIFACT_ID"'","name": "'"$POM_ARTIFACT_ID"'","organizationId":"'"$NEXUS_IM_ORG"'"}' ''$NEXUS_URL''
+        
+                mvn -s ${MAVEN_SETTINGS} -Djavax.net.ssl.trustStore=/var/certs/cacerts com.sonatype.clm:clm-maven-plugin:evaluate -Dclm.applicationId=$POM_ARTIFACT_ID -Dclm.serverUrl=$NEXUS_BASE_URL -Dclm.username='${Username}' -Dclm.password='${Password}' -Dclm.stage=$SONATYPE_STAGE -Dclm.resultFile=./results.json
+                cat results.json | /home/jenkins/jq ".reportHtmlUrl"
+              """
+            }
+            
+          }
+        }
+        //Based on the Nexus IQ scan results from the stage right above and the policies setup on Nexus, this will post success or failure and the url to scan report to the GitHub.
+        post {
+          success{
+            withCredentials([usernamePassword(credentialsId: 'DevOpsAdmin-ProdToken', passwordVariable: 'gitHubApiToken', usernameVariable: 'uname')]) {  
+
+              sh 'curl -X POST --user $uname:$gitHubApiToken -H "Accept: application/vnd.github.v3+json" --data  "{\\"state\\": \\"success\\", \\"context\\": \\"security-scan/sonatype\\", \\"description\\": \\"Scan completed after a successful Build!\\", \\"target_url\\": \\"$(cat ./results.json | /home/jenkins/jq -r .reportHtmlUrl)\\"}" --url $GITHUB_API_URL/${GIT_REPO_NAME}/statuses/${commitId} > /dev/null'
+            }
+          }
+          failure {
+            withCredentials([usernamePassword(credentialsId: 'DevOpsAdmin-ProdToken', passwordVariable: 'gitHubApiToken', usernameVariable: 'uname')]) {  
+
+              sh 'curl -X POST --user $uname:$gitHubApiToken -H "Accept: application/vnd.github.v3+json" --data  "{\\"state\\": \\"failure\\", \\"context\\": \\"security-scan/sonatype\\", \\"description\\": \\"Pipeline was failed due to Sonatype Security Gates\\", \\"target_url\\": \\"$(cat ./results.json | /home/jenkins/jq -r .reportHtmlUrl)\\"}" --url $GITHUB_API_URL/${GIT_REPO_NAME}/statuses/${commitId} > /dev/null'
+            }
+          }
+        }
+      }
+      //This pipeline stage creates Deployment Folders on the Edge node.
+      stage('Create Deployment Folders') {
+        parallel {
+          stage ('Create Encrypted HDFS Folders') {
+            when {
+              expression { DEPLOY_HDFS_FOLDERS == 'true'}
+            }
+            steps {
+              script {
+                setSshKeyValue()
+                sshagent(["${SSH_KEY_NAME}"]) {
+                  echo "This is where we would be looking for a file in the code repo to create certain HDFS folders in the encrypted zone."
+                  sh """
+                  #!/bin/bash -evox
+                  echo env.GIT_BRANCH
+                  #Make release dir at edge node if not already created
+                  ${SSH_TQ} 'mkdir -p ~/${RELEASE_FOLDER}'
+                  #Copy text file to edge node
+                  scp hdfs_folders.txt ${SSH_USER_HOST}:~/${RELEASE_FOLDER}
+                  #Create directories for HDFS using text file from edge node 
+                  ${SSH_TQ} 'kinit ${HDFS_SERVICE_ACCOUNT} -k -t ~/${EDGE_SERVICE_ACCOUNT}.keytab; xargs -I {} hadoop fs -mkdir -p {} < ~/${RELEASE_FOLDER}/hdfs_folders.txt'
+                  #Validate directories
+                  ${SSH_TQ} 'kinit ${HDFS_SERVICE_ACCOUNT} -k -t ~/${EDGE_SERVICE_ACCOUNT}.keytab; xargs -I {} hadoop fs -ls -C -R {} < ~/${RELEASE_FOLDER}/hdfs_folders.txt'
+                  #Clean up
+                  ${SSH_TQ} 'rm -rf ~/${RELEASE_FOLDER}'
+                  """
+                }
+              }
+            }
+          }
+          //This pipeline stage creates S3 folders.
+          stage ('Create S3 Folders') {
+            when {
+              expression { S3_CREATE_FOLDERS == 'true'}
+            }
+            steps {
+              script {
+                setSshKeyValue()
+                sshagent(["${SSH_KEY_NAME}"]) {
+                  //copy down the shell script used to create s3 folders into the workspace
+                  def s3_create_folders = libraryResource 'com/bcbsm/devops/ie/s3_create_folders.sh'
+                  writeFile(file:'./s3_create_folders.sh', text: s3_create_folders) 
+
+                  sh """
+                  #!/bin/bash -vx
+                  
+                  #Create s3 deployment folder on edgenode
+                  ${SSH_TQ} 'mkdir -p ~/${RELEASE_FOLDER}'
+                  #Set the s3_create_folders.sh to execute on build agent
+                  chmod +x ./s3_create_folders.sh
+                  #Copy the ./s3_create_folders_${ENV}.txt to the edgenode
+                  scp -q -o StrictHostKeyChecking=no ./s3_create_folders_${ENV}.txt ${SSH_USER_HOST}:~/${RELEASE_FOLDER}
+                  #Run dos2unix on the file to remove any weird carriage returns
+                  ${SSH_TQ} 'dos2unix ~/${RELEASE_FOLDER}/s3_create_folders_${ENV}.txt'
+                  #Execute the local script on the remote server and pass in the s3 folder file as a parameter
+                  ${SSH_TQ} "bash -s ~/${RELEASE_FOLDER}/s3_create_folders_${ENV}.txt" < ./s3_create_folders.sh
+                  #Cleanup after s3 folder stage is done
+                  ${SSH_TQ} 'rm -rf ~/${RELEASE_FOLDER}'
+                  """
+                }
+              }
+            }  
+          }
+          //This pipeline stage creates folders on the FTP server.
+          stage('Create SFTP Folders') {
+            when {
+              expression { SFTP_FOLDER_CREATION == 'true' }
+            }
+            steps {
+              echo "Creating SFTP Folders"
+              script {
+                setSshKeyValue()
+                sshagent(["${SSH_KEY_NAME}"]) {
+                  sh """
+                  #!/bin/bash -evox
+                  #Make release dir at edge node if not already created
+                  ${SSH_TQ} 'mkdir -p ~/${RELEASE_FOLDER}'
+                  #Copy text file to edge node
+                  scp sftp_folders.txt ${SSH_USER_HOST}:~/${RELEASE_FOLDER}
+                  
+                  #Create directories on SFTP node using text file from edge node
+                  ${SSH_TQ} "ssh ${SFTP_USER_HOST} -T -q xargs -I {} mkdir -p -v /dal_sftp/{} < ~/${RELEASE_FOLDER}/sftp_folders.txt"
+                  
+                  #Clean up
+                  ${SSH_TQ} 'rm -rf ~/${RELEASE_FOLDER}'
+                  """
+                }
+              }  
+            }
+          }
+        } 
+      }
+
+      //This pipeline stage creates the Application folders structure on the HDFS Cluster.
+
+      stage('Deploy Application to Edge Node') {
+        steps {
+          
+          script {
+            setSshKeyValue()
+            sshagent(["${SSH_KEY_NAME}"]) {
+              sh """
+              #!/bin/bash -evox
+              
+              #make a temp deploy folder on the build agent
+              mkdir -p /tmp/${RELEASE_FOLDER}
+              #Find all files not in certain folders and copy them into the temp deploy folder
+              find . -type f -not -path "*/target/*" -not -path "*/.git/*" -not -path "*/src/*" -not -path "*/scala/*" -not -path "*/jenkins/*" -not -path "*/pom.xml/*" -not -path "*/.gitignore" -not -name "pom.xml" -not -name "*.txt" -not -name "*.md" -exec cp --parents {} /tmp/${RELEASE_FOLDER} \\;
+              #Find all jar files and copy them into the temp deploy folder
+              find . -type f -name "*.jar" -exec cp --parents {} /tmp/${RELEASE_FOLDER} \\;
+              #This would show the files/folders in deployment folder
+              #tree /tmp/${RELEASE_FOLDER}
+              #Show the jars copied over 
+              find /tmp/${RELEASE_FOLDER} -name "*.jar"
+              #Create the folder structure on the edge node
+              ${SSH_TQ} 'mkdir -p /bcbs/apps/${POM_ARTIFACT_ID}/releases/${RELEASE_FOLDER};mkdir -p ~/${RELEASE_FOLDER}'
+              #Copy over the contents of the deployment folder to the edge node
+              scp -q -o StrictHostKeyChecking=no -r /tmp/${RELEASE_FOLDER} ${SSH_USER_HOST}:/bcbs/apps/${POM_ARTIFACT_ID}/releases
+              #Update file permissions of the files on the edge node
+              ${SSH_TQ} 'find /bcbs/apps/${POM_ARTIFACT_ID}/releases/${RELEASE_FOLDER} -type f -exec chmod 774 {} \\;'
+              #Cleanup the /tmp folder of the build agent after we scp to edge node
+              rm -rf /tmp/${RELEASE_FOLDER}
+            
+              #List out the files and folders that were moved to the edge node
+              ${SSH_TQ} tree /bcbs/apps/${POM_ARTIFACT_ID}
+              #Login to HDFS and make the folder structure
+              ${SSH_TQ} 'kinit ${HDFS_SERVICE_ACCOUNT} -k -t ~/${EDGE_SERVICE_ACCOUNT}.keytab; hdfs dfs -mkdir -p /bcbs/apps/${POM_ARTIFACT_ID}/${ENV};'
+              #Find all folders with oozie and copy them into the temp deploy folder
+              ${SSH_TQ} 'cd /bcbs/apps/${POM_ARTIFACT_ID}/releases/${RELEASE_FOLDER}; find . -type d -name "oozie" -exec cp -R --parents {} ~/${RELEASE_FOLDER}/. \\;'
+              
+              #List out files and folders in ~/${RELEASE_FOLDER} on edgenode
+              ${SSH_TQ} 'tree ~/${RELEASE_FOLDER}'
+              #Put the files in the edge node into HDFS
+              ${SSH_TQ} 'kinit ${HDFS_SERVICE_ACCOUNT} -k -t ~/${EDGE_SERVICE_ACCOUNT}.keytab; hdfs dfs -put -f ~/${RELEASE_FOLDER}/* /bcbs/apps/${POM_ARTIFACT_ID}/${ENV};'
+              #Update File permissions in HDFS
+              ${SSH_TQ} 'kinit ${HDFS_SERVICE_ACCOUNT} -k -t ~/${EDGE_SERVICE_ACCOUNT}.keytab; hdfs dfs -chmod -R 774 /bcbs/apps/${POM_ARTIFACT_ID}/${ENV};'
+              #List out the directory structure to show the time/date stamp change
+              ${SSH_TQ} 'kinit ${HDFS_SERVICE_ACCOUNT} -k -t ~/${EDGE_SERVICE_ACCOUNT}.keytab; hdfs dfs -ls -R /bcbs/apps/${POM_ARTIFACT_ID}/${ENV};'
+              #Set the symlink
+              ${SSH_TQ} 'ln -sfFn /bcbs/apps/${POM_ARTIFACT_ID}/releases/${RELEASE_FOLDER} /bcbs/apps/${POM_ARTIFACT_ID}/${ENV}' 
+              
+              #Show that the symlink has been created
+              ${SSH_TQ} 'ls -lah /bcbs/apps/${POM_ARTIFACT_ID}/'
+              #Cleanup the home directory 
+              ${SSH_TQ} 'rm -rf ~/${RELEASE_FOLDER}'
+              """
+            }
+          }
+         
+        }
+      }
+      //TODO
+      stage('Create Database Tables') {
+        steps {
+          echo "FUTURE DEVELOPMENT: Run .hql steps"
+        }
+      }
+      //TODO
+      stage('IE ABC Admin Tasks') {
+        steps {
+          echo "FUTURE DEVELOPMENT: Execute DDL Script"
+
+        }
+      }
+      //TODO
+      stage('Production Support Tasks') {
+        steps {
+          echo "FUTURE DEVELOPMENT: Doing some Production Support Tasks"
+        }
+      }
+      //TODO
+      stage('Submit Spark Jobs') {
+        steps {
+          echo "FUTURE DEVELOPMENT: Execute Spark Jobs"
+        }
+      }
+      //TODO
+      stage ('Deployment Cleanup') {
+        steps {
+          echo "FUTURE DEVELOPMENT: Do Deployment Cleanup steps"
+        }
+      }
+    }
+    //cleanWs: Delete workspace when build is done.
+    post {
+      cleanup {
+        cleanWs()
+      }
+    }
+  }
+}
+//Conditionally set the sonatype policy based on branch and environment var from jenkinsfile
+//Sonatype policy will break the build and is managed on that server per BCBSM Org.
+//Sonatype policies: proxy, develop, build, stage, release, operate
+//url: https://nexus-iq-server.bcbsm.com/assets/index.html#/management/view/organization/3744e6221fa8435583d6dac4d211d3ce
+
+def setSonatypeStage() {
+  if (ENV != null && ENV.equals("prod") && GIT_BRANCH.equals("master")) {
+    //this should be set to operate after the process has been
+    //established with security, COE and development teams
+    SONATYPE_STAGE = "build"
+  } 
+  else {
+    SONATYPE_STAGE = "build"
+  }
+}
+
+def setSshKeyValue() {
+  if (ENV.equals("dev")) {
+    SSH_KEY_NAME = "ie-ssh-key"
+  } 
+  else if (ENV.equals("prod")) {
+    SSH_KEY_NAME = "ie-ssh-prod-key"
+  }
+  else {
+    error("Valid Values for Environment are dev and prod")
+  }
+}
